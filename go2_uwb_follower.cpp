@@ -1,21 +1,17 @@
 /*
  * go2_uwb_follower.cpp
  * =====================
- * UWB 引导�?Go2 仿狗跟随控制�?(C++ / ROS2)
+ * UWB 引导的 Go2 仿狗跟随控制器 (C++ / ROS2)
  *
- * 架构 (赵虚左教程体�?:
- *   ESP32 串口 (~15Hz) ──�?本节�? *                              �? 帧累�?+ 低通滤�?+ PID 控制
- *                              �? *                         /api/sport/request  (unitree_api/msg/Request)
- *                              �? api_id=1008, param={"x":vx,"y":0,"z":vyaw}
- *                              �? *                         go2_driver ──�?Go2 真机
+ * 架构:
+ *   ESP32 串口 (~15Hz) -> 本节点 -> /api/sport/request -> Go2
  *
  * 三个关键设计:
- *   1. 指令限频 �?�?200ms 发布一�?Move, 期间多帧平均 (防抽�?
- *   2. 数据平滑 �?尖峰过滤 �?帧间平均 �?低通滤�? 三层去抖
- *   3. 死区防抖 �?距离 ±15cm / 角度 ±8° 死区, 抑制 UWB 浮动
+ *   1. 指令限频 -- 每 200ms 发布一条 Move, 期间多帧平均 (防抽搐)
+ *   2. 数据平滑 -- 尖峰过滤 -> 帧间平均 -> 低通滤波, 三层去抖
+ *   3. 死区防抖 -- 距离 +/-15cm / 角度 +/-8deg 死区, 抑制 UWB 浮动
  *
- * 编译: 放进你的 ROS2 workspace, 配合下方 CMake 片段
- * 运行: ros2 run go2_uwb_follower go2_uwb_follower --ros-args -p serial_port:=/dev/ttyUSB0
+ * 编译 & 运行: 见 README.md
  */
 
 #include <chrono>
@@ -24,7 +20,7 @@
 #include <cstring>
 #include <string>
 
-/* POSIX 串口 (Linux) */
+/* POSIX serial (Linux) */
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -38,7 +34,7 @@
 using namespace std::chrono_literals;
 
 /* ================================================================
- *  Go2 Sport API ID 映射 (�?go2_driver 一�?
+ *  Go2 Sport API ID mapping (matches go2_driver)
  * ================================================================ */
 constexpr int32_t API_ID_BALANCESTAND = 1002;
 constexpr int32_t API_ID_STOPMOVE     = 1003;
@@ -49,51 +45,53 @@ constexpr int32_t API_ID_RISESIT      = 1007;
 constexpr int32_t API_ID_MOVE         = 1008;
 
 /* ================================================================
- *  �?�?�?�? * ================================================================ */
+ *  Configuration parameters
+ * ================================================================ */
 namespace cfg {
-    /* —�?跟随距离 —�?*/
-    constexpr float TARGET_DISTANCE_CM   = 100.0f;   /* 理想跟随距离 1m        */
-    constexpr float DIST_DEADZONE_CM     =  15.0f;   /* 距离死区               */
-    constexpr float ANGLE_DEADZONE_DEG   =   8.0f;   /* 角度死区               */
+    /* -- Following distance -- */
+    constexpr float TARGET_DISTANCE_CM   = 100.0f;   /* ideal standoff 1m          */
+    constexpr float DIST_DEADZONE_CM     =  15.0f;   /* distance dead zone          */
+    constexpr float ANGLE_DEADZONE_DEG   =   8.0f;   /* angle dead zone            */
 
-    /* —�?PID 增益 (距离 PID, 角度�?P) —�?*/
-    constexpr float KP_DIST  = 0.006f;    /* P: m/s per cm 误差     */
-    constexpr float KI_DIST  = 0.0003f;   /* I: 消静�?             */
-    constexpr float KD_DIST  = 0.002f;    /* D: 抑超�?             */
-    constexpr float KP_ANGLE = 0.025f;    /* P: rad/s per deg 误差  */
+    /* -- PID gains (distance PID, angle pure P) -- */
+    constexpr float KP_DIST  = 0.006f;    /* P: m/s per cm err         */
+    constexpr float KI_DIST  = 0.0003f;   /* I: steady-state correct   */
+    constexpr float KD_DIST  = 0.002f;    /* D: dampen overshoot       */
+    constexpr float KP_ANGLE = 0.025f;    /* P: rad/s per deg err      */
 
-    /* —�?速度限幅 —�?*/
+    /* -- Speed limits -- */
     constexpr float MAX_FWD_SPEED  =  0.8f;
     constexpr float MAX_BACK_SPEED = -0.4f;
     constexpr float MAX_TURN_SPEED =  0.8f;
-    constexpr float MAX_ACCEL      =  0.5f;   /* m/s^2, 防猛�?     */
+    constexpr float MAX_ACCEL      =  0.5f;   /* m/s^2, anti-jerk      */
 
-    /* —�?信号丢失 —�?*/
+    /* -- Signal loss -- */
     constexpr double SIGNAL_TIMEOUT_SEC = 3.0;
     constexpr double SEARCH_DURATION_SEC = 8.0;
     constexpr float  SEARCH_TURN_SPEED  = 0.4f;
 
-    /* —�?滤波与去�?—�?*/
-    constexpr float FILTER_ALPHA   = 0.15f;   /* 距离低通系�?        */
-    constexpr float AZI_ALPHA      = 0.22f;   /* 角度低通系�?稍快)   */
-    constexpr float SPIKE_LIMIT_CM = 50.0f;   /* 单帧跳变超此丢弃     */
+    /* -- Filter / de-jitter -- */
+    constexpr float FILTER_ALPHA   = 0.15f;   /* distance LP coefficient    */
+    constexpr float AZI_ALPHA      = 0.22f;   /* angle LP coefficient       */
+    constexpr float SPIKE_LIMIT_CM = 50.0f;   /* spike rejection threshold  */
 
-    /* —�?指令节拍 —�?*/
-    constexpr auto  CMD_INTERVAL = 200ms;     /* Move 发布间隔       */
-    constexpr auto  MAIN_LOOP    = 10ms;      /* 主循环周�?         */
+    /* -- Command pacing -- */
+    constexpr auto  CMD_INTERVAL = 200ms;     /* Move publish interval       */
+    constexpr auto  MAIN_LOOP    = 10ms;      /* main loop period            */
 
-    /* —�?串口 —�?*/
+    /* -- Serial -- */
     constexpr int   SERIAL_BAUD    = 115200;
     constexpr int   BUF_SIZE       = 256;
-    constexpr int   ACCUM_MAX      = 8;       /* 单指令最大累积帧�?  */
-    constexpr int   NO_DATA_THRESH = 5;       /* 连续空读次数判丢信号  */
+    constexpr int   ACCUM_MAX      = 8;       /* max frames per command      */
+    constexpr int   NO_DATA_THRESH = 5;       /* consecutive empty reads     */
 
-    /* —�?搜索切换阈�? 信号恢复后连续收到N帧才退出搜�?—�?*/
+    /* -- Recovery: frames needed to exit search -- */
     constexpr int   RECOVERY_FRAMES = 3;
 }
 
 /* ================================================================
- *  �?�?�?�? * ================================================================ */
+ *  Frame accumulator
+ * ================================================================ */
 class FrameAccum {
     int   dist_sum_   = 0;
     int   azi_sum_    = 0;
@@ -102,7 +100,7 @@ class FrameAccum {
 public:
     void reset() { dist_sum_=0; azi_sum_=0; count_=0; }
 
-    /* 加帧 (带尖峰检�? */
+    /* Add frame (with spike detection). Returns false if dropped. */
     bool add(int dist, int azi, int* dropped) {
         if (count_ > 0) {
             float jump = std::fabs((float)dist - dist_prev_);
@@ -130,7 +128,8 @@ public:
 };
 
 /* ================================================================
- *  �?�?�?�?�? * ================================================================ */
+ *  Low-pass filter
+ * ================================================================ */
 class LowPassFilter {
     float alpha_;
     float value_ = 0.0f;
@@ -148,7 +147,7 @@ public:
 };
 
 /* ================================================================
- *  �?�?(Linux POSIX)
+ *  Serial port (Linux POSIX)
  * ================================================================ */
 class SerialPort {
     int  fd_ = -1;
@@ -188,13 +187,14 @@ public:
     bool is_open() const { return fd_ >= 0; }
 
     /*
-     * 非阻塞读取一�?"dist,azi"
-     * 返回 true 表示解析成功一�?     */
+     * Non-blocking read of one "dist,azi" frame.
+     * Returns true when a frame was successfully parsed.
+     */
     bool read_frame(int* dist_cm, int* azi_deg) {
         static char buf[cfg::BUF_SIZE];
         static int  pos = 0;
 
-        /* 检查是否有数据可读 */
+        /* Check for available data */
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(fd_, &fds);
@@ -229,19 +229,20 @@ public:
 };
 
 /* ================================================================
- *  �?�?�?�?�? * ================================================================ */
+ *  Main control node
+ * ================================================================ */
 class UwbFollowerNode : public rclcpp::Node {
 public:
     UwbFollowerNode() : Node("go2_uwb_follower") {
-        /* 声明参数 (运行时可通过 ros2 run --ros-args -p 覆盖) */
+        /* Declare ROS2 parameters */
         this->declare_parameter<std::string>("serial_port", "/dev/ttyUSB0");
         this->declare_parameter<int>("serial_baud", cfg::SERIAL_BAUD);
 
-        /* 创建发布�?�?/api/sport/request */
+        /* Publisher -> /api/sport/request */
         req_pub_ = this->create_publisher<unitree_api::msg::Request>(
             "/api/sport/request", 10);
 
-        /* 打开串口 */
+        /* Open serial port */
         std::string port = this->get_parameter("serial_port").as_string();
         if (!ser_.open(port, cfg::SERIAL_BAUD)) {
             RCLCPP_ERROR(get_logger(), "Serial open failed. Exiting.");
@@ -249,16 +250,17 @@ public:
             return;
         }
 
-        /* 让狗站起�?*/
+        /* Stand up the dog */
         send_action(API_ID_STANDUP);
         rclcpp::sleep_for(2s);
 
-        /* 主循环定时器 (~100 Hz) */
+        /* Main loop timer (~100 Hz) */
         timer_ = this->create_wall_timer(cfg::MAIN_LOOP, [this]() { main_tick(); });
 
-        /* 信号跟踪初始�?*/
+        /* Initialise timestamps */
         last_signal_time_ = this->now().seconds();
         last_cmd_time_    = this->now();
+        last_pid_time_    = this->now();
 
         RCLCPP_INFO(get_logger(),
             "UWB Follower started. Target=%.0f cm, deadzone_dist=%.0f cm, "
@@ -276,14 +278,14 @@ public:
     }
 
 private:
-    /* ============ ROS2 通信 ============ */
+    /* ============ ROS2 communication ============ */
     rclcpp::Publisher<unitree_api::msg::Request>::SharedPtr req_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
-    /* ============ 硬件 ============ */
+    /* ============ Hardware ============ */
     SerialPort ser_;
 
-    /* ============ 控制状�?============ */
+    /* ============ Control state ============ */
     enum State { FOLLOWING=0, APPROACHING, BACKING_OFF, TURNING, SEARCHING, LOST };
     static const char* state_name(State s) {
         switch(s) {
@@ -299,32 +301,32 @@ private:
 
     State  state_ = FOLLOWING;
 
-    /* 滤波�?*/
+    /* Filters */
     LowPassFilter dist_filt_{cfg::FILTER_ALPHA};
     LowPassFilter azi_filt_{cfg::AZI_ALPHA};
 
-    /* PID 状�?*/
+    /* PID state */
     float dist_error_sum_  = 0.0f;
     float dist_error_prev_ = 0.0f;
     float prev_vx_   = 0.0f;
     float prev_vyaw_ = 0.0f;
     rclcpp::Time last_pid_time_;
 
-    /* 信号跟踪 */
+    /* Signal tracking */
     double      last_signal_time_ = 0.0;
     double      search_start_time_ = 0.0;
     rclcpp::Time last_cmd_time_;
 
-    /* 帧累�?*/
+    /* Frame accumulator */
     FrameAccum  accum_;
 
-    /* 统计 */
+    /* Stats */
     int no_data_count_   = 0;
-    int recovery_count_  = 0;   /* 搜索中信号恢复的确认计数 */
+    int recovery_count_  = 0;   /* signal-recovery confirmation counter */
     int total_frames_    = 0;
     int spike_drops_     = 0;
 
-    /* ============ 发布动作 ============ */
+    /* ============ Publish actions ============ */
 
     void send_move(float vx, float vyaw) {
         auto req = unitree_api::msg::Request();
@@ -343,10 +345,10 @@ private:
         req_pub_->publish(req);
     }
 
-    /* ============ 主循�?tick ============ */
+    /* ============ Main loop tick ============ */
 
     void main_tick() {
-        /* 1. 读取串口 */
+        /* 1. Read serial */
         int dist_cm = 0, azi_deg = 0;
         bool got_frame = ser_.read_frame(&dist_cm, &azi_deg);
 
@@ -360,7 +362,7 @@ private:
                 handle_no_signal();
         }
 
-        /* 2. 检查是否该发指令了 (即便单帧不触�? 累积到时间点也会触发) */
+        /* 2. Check if it's time to dispatch a command */
         auto now = this->now();
         if ((now - last_cmd_time_) >= cfg::CMD_INTERVAL) {
             if (accum_.ready() && state_ != LOST && state_ != SEARCHING) {
@@ -370,13 +372,13 @@ private:
         }
     }
 
-    /* ============ 处理数据�?============ */
+    /* ============ Frame processing ============ */
 
     void process_frame(int dist_cm, int azi_deg) {
         total_frames_++;
         last_signal_time_ = this->now().seconds();
 
-        /* 信号恢复确认 (搜索/LOST �?恢复) */
+        /* Signal recovery confirmation (SEARCHING/LOST -> FOLLOWING) */
         if (state_ == SEARCHING || state_ == LOST) {
             recovery_count_++;
             if (recovery_count_ >= cfg::RECOVERY_FRAMES) {
@@ -390,23 +392,23 @@ private:
                 accum_.reset();
                 recovery_count_ = 0;
             }
-            /* 还在确认�? 继续累积但不发指�?*/
+            /* Still confirming -- accumulate but don't dispatch */
             accum_.add(dist_cm, azi_deg, &spike_drops_);
             return;
         }
 
-        /* 累积�?(尖峰过滤�?add 内部完成) */
+        /* Accumulate frame (spike filtering inside add()) */
         accum_.add(dist_cm, azi_deg, &spike_drops_);
     }
 
-    /* ============ 信号丢失 ============ */
+    /* ============ Signal loss ============ */
 
     void handle_no_signal() {
         double now_sec = this->now().seconds();
         double elapsed = now_sec - last_signal_time_;
 
         if (elapsed < cfg::SIGNAL_TIMEOUT_SEC)
-            return;  /* 短暂丢包, 保持最后指�?*/
+            return;  /* Brief dropout, hold last command */
 
         if (state_ != SEARCHING && state_ != LOST) {
             state_ = SEARCHING;
@@ -423,40 +425,40 @@ private:
         if (state_ == SEARCHING) {
             if (now_sec - search_start_time_ > cfg::SEARCH_DURATION_SEC) {
                 state_ = LOST;
-                RCLCPP_WARN(get_logger(), "Search timeout. Sitting down.");
+                RCLCPP_WARN(get_logger(), "Search timeout. Stopping and waiting.");
                 send_action(API_ID_STOPMOVE);
                 rclcpp::sleep_for(300ms);
                 send_move(0.0f, 0.0f);
                 return;
             }
-            /* 旋转搜索 */
+            /* Spin to search */
             send_move(0.0f, cfg::SEARCH_TURN_SPEED);
         }
-        /* LOST: 不做动作 */
+        /* LOST: do nothing, wait for signal */
     }
 
-    /* ============ 指令计算与发�?============ */
+    /* ============ Command computation & dispatch ============ */
 
     void dispatch_command() {
         if (!accum_.ready()) return;
 
-        /* 取出本周期平均距�?角度 */
+        /* Extract per-cycle averaged distance and angle */
         float dist_avg = 0.0f, azi_avg = 0.0f;
         accum_.get_avg(&dist_avg, &azi_avg);
         accum_.reset();
 
-        /* 低通滤�?*/
+        /* Low-pass filter */
         float dist_f = dist_filt_.update(dist_avg);
         float azi_f  = azi_filt_.update(azi_avg);
 
-        /* 更新状态机 */
+        /* Update state machine */
         update_state(dist_f, azi_f);
 
-        /* PID 计算 */
+        /* PID computation */
         float vx = 0.0f, vyaw = 0.0f;
         compute_pid(dist_f, azi_f, &vx, &vyaw);
 
-        /* 发布 */
+        /* Publish */
         send_move(vx, vyaw);
 
         RCLCPP_INFO(get_logger(),
@@ -484,7 +486,7 @@ private:
     }
 
     void compute_pid(float dist_f, float azi_f, float* vx, float* vyaw) {
-        /* ── 距离 PID ── */
+        /* -- Distance PID -- */
         float err = dist_f - cfg::TARGET_DISTANCE_CM;
         if (std::fabs(err) < cfg::DIST_DEADZONE_CM) err = 0.0f;
 
@@ -497,7 +499,7 @@ private:
         /* P */
         float p = cfg::KP_DIST * err;
 
-        /* I (抗饱�? */
+        /* I (anti-windup) */
         if (std::fabs(err) < 80.0f) {
             dist_error_sum_ += err * (float)dt;
             if (dist_error_sum_ >  30.0f) dist_error_sum_ =  30.0f;
@@ -515,14 +517,14 @@ private:
         if (vx_cmd > cfg::MAX_FWD_SPEED)  vx_cmd = cfg::MAX_FWD_SPEED;
         if (vx_cmd < cfg::MAX_BACK_SPEED) vx_cmd = cfg::MAX_BACK_SPEED;
 
-        /* 加速度限幅 */
+        /* Acceleration limit */
         float accel_lim = cfg::MAX_ACCEL * (float)dt;
         float delta = vx_cmd - prev_vx_;
         if      (delta >  accel_lim) vx_cmd = prev_vx_ + accel_lim;
         else if (delta < -accel_lim) vx_cmd = prev_vx_ - accel_lim;
         prev_vx_ = vx_cmd;
 
-        /* ── 角度 P ── */
+        /* -- Angle P -- */
         float azi = azi_f;
         if (std::fabs(azi) < cfg::ANGLE_DEADZONE_DEG) azi = 0.0f;
 
@@ -530,7 +532,7 @@ private:
         if (vyaw_cmd >  cfg::MAX_TURN_SPEED) vyaw_cmd =  cfg::MAX_TURN_SPEED;
         if (vyaw_cmd < -cfg::MAX_TURN_SPEED) vyaw_cmd = -cfg::MAX_TURN_SPEED;
 
-        /* 后退时转向反�?*/
+        /* Reverse turn direction when backing up */
         if (vx_cmd < 0.0f) vyaw_cmd = -vyaw_cmd;
         prev_vyaw_ = vyaw_cmd;
 
