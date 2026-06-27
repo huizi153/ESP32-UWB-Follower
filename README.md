@@ -7,7 +7,7 @@
 - **操作系统**: Ubuntu 22.04 LTS
 - **ROS2 发行版**: Humble
 - **通信中间件**: CycloneDDS
-- **机器人**: 宇树 Go2 EDU
+- **机器狗**: 宇树 Go2 EDU
 
 ## 前置条件 (必读)
 
