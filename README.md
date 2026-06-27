@@ -12,7 +12,7 @@
 ## 前置条件 (必读)
 
 本项目是**自动跟随控制层**。在此之前必须先打通电脑与机器狗的基础通信链路。
-这一部分详见:
+这一部分由组内其他同学完成, 详见:
 
 > **Go2 开发教程 —— 从环境搭建到键盘遥控**
 > https://ztl3106742440-hub.github.io/go2-tutorial/
@@ -25,26 +25,65 @@
 
 **若键盘控制还没跑通, 先回到上方教程补齐环境, 不要跳过。**
 
-## 项目简介
+## 总体数据链路
 
-从 ESP32 串口读取 UWB 测距测角数据 (格式: `距离cm,方位角度`),
-通过 ROS2 话题 `/api/sport/request` 控制机器狗像狗一样跟随信号源。
-
-**注意**: 本节点和键盘控制节点不能同时运行——两者都往 `/api/sport/request` 发指令, 同时跑会导致狗抽搐。
+```
+UWB 传感器 ──► ESP32 发射端 ──(ESP-NOW)──► ESP32 接收端 ──(串口)──► PC
+   (测距测角)    (Transmitter)              (Receiver)     COM口      Ubuntu
+                                                                      │
+                                                              go2_uwb_follower
+                                                              (ROS2 跟随节点)
+                                                                      │
+                                                              /api/sport/request
+                                                                      │
+                                                                 Go2 真机
+```
 
 ## 文件说明
 
-| 文件 | 作用 |
-|------|------|
-| `go2_uwb_follower.cpp` | ROS2 控制节点 (C++) |
-| `package.xml` | ROS2 包清单 |
-| `CMakeLists.txt` | 编译配置 |
-| `README.md` | 本说明 |
+| 文件 | 语言 | 运行位置 | 作用 |
+|------|------|----------|------|
+| `ESP32_Transmitter.ino` | C++ (Arduino) | ESP32 (发射端) | 读取 UWB 传感器, 通过 ESP-NOW 广播距离和方位角 |
+| `ESP32_Receiver.ino` | C++ (Arduino) | ESP32 (接收端) | 通过 ESP-NOW 接收数据, 串口输出 `距离cm,方位角度` 到 PC, 同时支持蓝牙启停 |
+| `go2_uwb_follower.cpp` | C++ (ROS2) | Ubuntu PC | 读取串口数据, PID 控制 + 状态机, 通过 ROS2 话题控制 Go2 |
+| `package.xml` | XML | Ubuntu PC | ROS2 包清单 |
+| `CMakeLists.txt` | CMake | Ubuntu PC | 编译配置 |
+| `README.md` | — | — | 本说明 |
 
-## 编译
+## ESP32 代码逻辑
+
+### ESP32_Transmitter.ino (发射端)
+
+挂在信号源 (人/目标) 上, 连接 UWB 模块。
+
+- 实时采集 UWB 测距 (cm) 和方位角 (度, 正=左, 负=右)
+- 通过 ESP-NOW 协议广播, 帧格式: `"Dist:距离,Angle:角度"`
+- 不依赖 WiFi 路由器, 两个 ESP32 点对点直连
+
+### ESP32_Receiver.ino (接收端)
+
+连接在 Ubuntu PC 的 USB 口上, 负责接收无线数据并转为串口输出。
+
+**接收逻辑**:
+- 通过 ESP-NOW 回调 `OnDataRecv()` 接收发射端广播
+- 解析 `"Dist:距离,Angle:角度"` 格式
+- 转为纯净格式 `"距离,角度\n"` 通过硬件串口 (`Serial`) 发给 PC
+- PC 端 `go2_uwb_follower.cpp` 读取此串口数据
+
+**蓝牙启停控制** (JDY 模块, 接在 Serial2):
+- 手机蓝牙发送 `"110"` → 接收端开始转发 UWB 数据 (`isRunning = true`)
+- 手机蓝牙发送 `"010"` → 接收端停止转发 UWB 数据 (`isRunning = false`)
+- 停止时每 50ms 输出固定值 `"100,0\n"` (虚拟数据, 含义: 距离 1m, 角度 0°)
+
+> **为什么停发时输出 `100,0`?**
+> 如果完全停止输出串口数据, PC 端的跟随程序会在 3 秒后判定信号丢失、进入旋转搜索。
+> 输出 `"100,0"` 相当于告诉狗 "目标就在正前方 1m 处", 狗会停在原地不动,
+> 既不会乱转也不会趴下。蓝牙发 `"110"` 恢复后立即进入正常跟随。
+
+## PC 端编译
 
 ```bash
-# 1. 将本目录下四个文件放入工作空间
+# 1. 将 PC 端四个文件放入工作空间
 mkdir -p ~/unitree_go2_ws/src/go2_uwb_follower
 cp go2_uwb_follower.cpp CMakeLists.txt package.xml ~/unitree_go2_ws/src/go2_uwb_follower/
 
@@ -54,7 +93,7 @@ colcon build --packages-select go2_uwb_follower
 source install/setup.bash
 ```
 
-## 运行
+## 运行步骤 (完整流程)
 
 ```bash
 # 1. ROS2 环境 + CycloneDDS + 网卡绑定 (与键盘控制完全相同)
@@ -68,17 +107,21 @@ source ~/unitree_go2_ws/install/setup.bash
 # 3. ESP32 串口权限
 sudo chmod 666 /dev/ttyACM0
 
-# 4. 启动跟随
+# 4. 手机蓝牙发送 "110" 启动数据转发 (或在 ESP32 上电即自动启动)
+
+# 5. 启动跟随
 ros2 run go2_uwb_follower go2_uwb_follower --ros-args -p serial_port:=/dev/ttyACM0
 ```
 
 **注意**: 网卡名 `enx00e04c5a4608` 和串口号 `/dev/ttyACM0` 需根据实际环境修改。
 
-## 控制原理
+**注意**: 本节点和键盘控制节点不能同时运行——两者都往 `/api/sport/request` 发指令, 同时跑会导致狗抽搐。
+
+## PC 端控制原理
 
 ```
 ESP32 串口 (~15Hz)
-  |  "距离cm,方位角度"  如 "15,25" = 15cm, 左偏 25度
+  │  "距离cm,方位角度"  如 "15,25" = 15cm, 左偏 25度
   v
 帧累积器 (200ms 周期)   尖峰过滤 -> 多帧平均 -> 低通滤波 (三层抗抖)
   v
@@ -90,9 +133,9 @@ Go2 真机                接收 Move(vx, vyaw) 指令
 ```
 
 - **指令限频**: 每 200ms 发布一条 Move (5Hz), UWB 数据 ~15Hz 输入但指令低频输出, 防止狗抽搐
-- **信号丢失**: 短时丢包忽略 -> 3 秒超时原地旋转搜索 -> 8 秒搜索超时停止等待恢复
+- **信号丢失**: 短时丢包忽略 → 3 秒超时原地旋转搜索 → 8 秒搜索超时停止等待恢复
 
-## 可调参数
+## PC 端可调参数
 
 所有参数在 `go2_uwb_follower.cpp` 顶部 `namespace cfg` 中, 改数值重编译即可:
 
